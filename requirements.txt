@@ -1,0 +1,54 @@
+# ───────────────────────────────────────────────────────────────
+# rag-service — requirements.txt EXACTO (versiones pinned)
+# ───────────────────────────────────────────────────────────────
+#
+# Todas las versiones están fijadas con == para garantizar reproducibilidad
+# e impedir que pip resuelva una combinación rota (como huggingface-hub 1.x
+# que tiene bug de auth con modelos públicos).
+#
+# Setup limpio recomendado:
+#   rm -rf venv
+#   python3.11 -m venv venv
+#   source venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# Probado en Python 3.11 (también funciona en 3.10 y 3.12).
+# ───────────────────────────────────────────────────────────────
+
+# Servidor HTTP
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+python-dotenv==1.0.1
+
+# Stack LangChain (rama 0.3.x estable, compatible entre sí)
+langchain==0.3.0
+langchain-core==0.3.15
+langchain-community==0.3.0
+langchain-text-splitters==0.3.0
+langchain-chroma==0.1.4
+langchain-huggingface==0.1.2
+
+# Base vectorial
+chromadb==0.5.20
+
+# Embeddings y modelo
+# IMPORTANTE: huggingface-hub<0.30 es OBLIGATORIO. La rama 1.x tiene un bug
+# que devuelve 401 al acceder a modelos públicos.
+sentence-transformers==2.7.0
+huggingface-hub==0.29.3
+transformers==4.49.0
+tokenizers==0.21.4
+safetensors==0.4.5
+
+# Extracción PDF
+pypdf==4.3.1
+
+# Testing
+pytest==8.3.3
+httpx==0.27.2
+
+# ── RAG Camino A (LLM local vía Ollama) ────────────────────────
+# Descomentar para activar Camino A. Ver docs/rag_camino_a.md
+# langchain-ollama==0.2.0
