@@ -22,6 +22,20 @@ PORT = int(os.getenv("RAG_PORT", "8001"))
 MODO_DEFAULT = os.getenv("RAG_MODO_DEFAULT", "simple")  # "simple" | "llm"
 SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "1.2"))
 
+# ── Recuperación multi-chunk (MEJORA DE CALIDAD) ─────────────────────────────
+# Cuántos chunks recuperar por consulta antes de filtrar por umbral.
+# Subir de 1 (versión anterior) a 4 permite combinar pasajes contiguos que
+# juntos forman la respuesta completa, en vez de jugarse todo a un solo chunk.
+RETRIEVE_K = int(os.getenv("RAG_RETRIEVE_K", "4"))
+
+# Cuántos de los chunks relevantes combinar en la respuesta final.
+# 2 suele bastar para cubrir una respuesta partida por el chunking sin saturar.
+COMBINAR_TOP_N = int(os.getenv("RAG_COMBINAR_TOP_N", "2"))
+
+# Tope de caracteres de la respuesta combinada (antes del marco textual).
+# Mantiene la respuesta legible en el chat.
+RESPUESTA_MAX_CHARS = int(os.getenv("RAG_RESPUESTA_MAX_CHARS", "700"))
+
 # ── Modelo de embeddings ─────────────────────────────────────────────────────
 # Acepta tanto identificador de HuggingFace ("paraphrase-multilingual-MiniLM-L6-v2")
 # como una ruta local absoluta a una carpeta con el modelo descargado
