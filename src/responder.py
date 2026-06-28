@@ -55,7 +55,8 @@ def _pulir_chunk(texto: str, max_oraciones: int = _MAX_ORACIONES,
     if not texto:
         return texto
 
-    t = re.sub(r"\n(?!\n)", " ", texto)
+    t = re.sub(r"(\w+)-\n(\w+)", r"\1\2", texto)   # reunir guiones de corte
+    t = re.sub(r"\n(?!\n)", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
 
     for patron in _PATRONES_RUIDO:

@@ -15,6 +15,7 @@ Tiempo estimado: 1-3 minutos (primera vez descarga el modelo de embeddings,
                 ~90 MB; siguientes corridas usan caché local).
 """
 
+import re
 import sys
 import shutil
 import logging
@@ -31,6 +32,56 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("indexer")
 
 
+# ── Limpieza de texto del PDF (pre-chunking) ─────────────────────────────────
+# El PDF de cosmovisión es prosa limpia (fuentes embebidas, no es OCR), pero
+# arrastra tres artefactos que ensucian los chunks y degradan tanto el
+# retrieval como la respuesta mostrada:
+#   1. Encabezado de página repetido ("shipibo: territorio, historia y
+#      cosmovisión") pegado al cuerpo -> produce "cosmovisiónvisión".
+#   2. Números de página sueltos en su propia línea.
+#   3. Guiones de corte de línea ("caste-\nllano" -> "castellano").
+_HEADER_RE = re.compile(
+    r"^\s*shipibo:\s*territorio,?\s*historia\s*y\s*cosmovisi[oó]n\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_PAGENUM_RE = re.compile(r"^\s*\d{1,3}\s*$", re.MULTILINE)
+
+
+def limpiar_texto_pdf(texto: str) -> str:
+    """Quita encabezados/numeración repetida y reúne guiones de corte."""
+    if not texto:
+        return texto
+    texto = _HEADER_RE.sub("", texto)
+    texto = _PAGENUM_RE.sub("", texto)
+    texto = re.sub(r"(\w+)-\n(\w+)", r"\1\2", texto)          # de-hyphenation
+    texto = re.sub(r"(?<!\n)\n(?!\n)", " ", texto)            # unir saltos simples
+    texto = re.sub(r"[ \t]+", " ", texto)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
+
+
+# Palabras-función del español para medir si un chunk es prosa o tabla/glosario.
+# La prosa narrativa tiene ~40% de palabras-función; las tablas bilingües del
+# PDF (que pypdf linealiza como "ensalada" de columnas) tienen muy pocas.
+_PALABRAS_FUNCION = set(
+    "de la que el en y a los del se las por un para con no una su al lo como "
+    "mas pero sus le ya o este si porque esta entre cuando muy sin sobre tambien "
+    "me hasta hay donde quien desde todo nos durante todos uno les ni contra "
+    "otros ese eso ante ellos esto mi antes algunos unos otro otras otra tanto "
+    "esa estos mucho quienes nada muchos cual sea".split()
+)
+
+_UMBRAL_PROSA = 0.18
+
+
+def _ratio_prosa(texto: str) -> float:
+    """Fracción de palabras-función. Prosa ~0.4; tablas/glosarios < 0.15."""
+    toks = re.findall(r"[a-záéíóúñ]+", texto.lower())
+    if not toks:
+        return 0.0
+    return sum(1 for t in toks if t in _PALABRAS_FUNCION) / len(toks)
+
+
 def cargar_pdf() -> list:
     """Carga el PDF como documentos LangChain (uno por página)."""
     if not config.PDF_PATH.exists():
@@ -42,6 +93,12 @@ def cargar_pdf() -> list:
     loader = PyPDFLoader(str(config.PDF_PATH))
     docs = loader.load()
     log.info("Páginas cargadas: %d", len(docs))
+    # Limpieza pre-chunking: encabezados repetidos, numeración y guiones de
+    # corte. Se hace acá para que los embeddings se calculen sobre texto limpio
+    # (mejora el retrieval, no solo lo que se muestra).
+    for d in docs:
+        d.page_content = limpiar_texto_pdf(d.page_content)
+    log.info("Texto limpiado (encabezados, numeración, guiones de corte)")
     return docs
 
 
@@ -63,10 +120,19 @@ def chunkear(docs: list) -> list:
 
     # Filtrar chunks muy cortos (headers, pies de página, números sueltos)
     utiles = [c for c in chunks if len(c.page_content.strip()) >= 80]
-    descartados = len(chunks) - len(utiles)
-    if descartados:
-        log.info("Descartados %d chunks < 80 caracteres", descartados)
-    return utiles
+    descartados_cortos = len(chunks) - len(utiles)
+
+    # Filtrar chunks tipo tabla/glosario: el PDF tiene listas bilingües a
+    # varias columnas que pypdf linealiza como "ensalada" de palabras. Estos
+    # chunks ensucian el retrieval (matchean preguntas que no deberían) y dan
+    # respuestas incoherentes. Se detectan por baja densidad de palabras-función.
+    prosa = [c for c in utiles if _ratio_prosa(c.page_content) >= _UMBRAL_PROSA]
+    descartados_tabla = len(utiles) - len(prosa)
+
+    if descartados_cortos or descartados_tabla:
+        log.info("Descartados %d chunks cortos y %d chunks tipo tabla/glosario",
+                 descartados_cortos, descartados_tabla)
+    return prosa
 
 
 def construir_indice(chunks: list) -> Chroma:

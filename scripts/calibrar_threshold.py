@@ -44,6 +44,7 @@ RELEVANTES = [
     "¿qué importancia tiene el curandero o meraya?",
 ]
 
+
 # ── Preguntas IRRELEVANTES (NO deben tener respuesta en el PDF) ──────────────
 IRRELEVANTES = [
     "¿cómo hago una pizza margarita?",
