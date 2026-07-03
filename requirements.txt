@@ -11,7 +11,16 @@
 #   python3.11 -m venv venv
 #   source venv/bin/activate
 #   pip install --upgrade pip
+#   # PASO 1 — torch CPU-only desde el índice de PyTorch (evita la build CUDA,
+#   #          que son varios GB de nvidia-* y llena el disco). Va aparte porque
+#   #          --index-url fuerza SOLO ese índice y garantiza la rueda CPU:
+#   pip install torch==2.2.2 --index-url https://download.pytorch.org/whl/cpu
+#   # PASO 2 — el resto (torch ya queda satisfecho, no se vuelve a bajar):
 #   pip install -r requirements.txt
+#
+# El servicio corre en CPU (device='cpu' en indexer.py y retriever.py), así que
+# no necesita GPU ni CUDA. torch 2.2.2 es compatible con transformers 4.49.0 y
+# sentence-transformers 2.7.0.
 #
 # Probado en Python 3.11 (también funciona en 3.10 y 3.12).
 # ───────────────────────────────────────────────────────────────
