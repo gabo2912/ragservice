@@ -4,11 +4,11 @@ responder.py — Genera respuestas a partir de los chunks recuperados.
 Implementa dos modos:
   - "simple" (Camino B, ACTIVO): retrieval + framing textual. Cero LLM,
     cero alucinaciones, respuestas verificables literalmente del PDF.
-  - "llm"    (Camino A, PREPARADO): retrieval + síntesis con LLM local
-    vía Ollama. Activable cambiando RAG_MODO_DEFAULT=llm en .env, o
-    pasando modo="llm" en la request HTTP.
-
-Ver docs/rag_camino_a.md para el procedimiento completo de migración B→A.
+  - "llm"    (Camino A, ACTIVO con Gemini): retrieval + síntesis con la API
+    de Google Gemini (nube). Activable con RAG_MODO_DEFAULT=llm en .env, o
+    pasando modo="llm" en la request HTTP. Requiere GEMINI_API_KEY en .env.
+    Restringido al contexto recuperado para no alucinar; cae al Camino B si
+    el LLM falla, se agota el rate limit, o el contexto no responde.
 
 ── MEJORA DE CALIDAD (multi-chunk) ───────────────────────────────────────────
 Antes responder_simple() recuperaba UN solo chunk (k=1) y respondía con ese o
@@ -218,73 +218,171 @@ def responder_simple(query: str) -> Dict[str, Any]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CAMINO A (PREPARADO, DESACTIVADO) — retrieval + síntesis con LLM local
+# CAMINO A (ACTIVO con Gemini) — retrieval + síntesis con LLM en la nube
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# Para activar el Camino A:
-#   1. Instalar Ollama y descargar el modelo:   ollama pull phi3.5
-#   2. Verificar:                                curl http://localhost:11434/
-#   3. En requirements.txt, descomentar:         langchain-ollama>=0.2.0
-#      Reinstalar:                               pip install -r requirements.txt
-#   4. Descomentar el bloque de responder_llm() más abajo y borrar el stub.
-#   5. En .env cambiar:                          RAG_MODO_DEFAULT=llm
+# Usa la API de Google Gemini (Google AI Studio) para sintetizar una respuesta
+# a partir de los chunks recuperados del PDF. A diferencia del Camino B (que
+# muestra el pasaje tal cual), el Camino A redacta una respuesta en lenguaje
+# natural, PERO restringida al contexto recuperado para no alucinar.
 #
-# Ver docs/rag_camino_a.md para el procedimiento completo (15 minutos).
+# Requisitos:
+#   1. pip install google-genai  (ver requirements.txt)
+#   2. En .env:  GEMINI_API_KEY=<tu_key>  y  RAG_MODO_DEFAULT=llm
+#
+# Seguridad anti-alucinación: el prompt obliga al modelo a responder SOLO con
+# el contexto; si el contexto no alcanza, devuelve una señal de "sin datos" y
+# caemos al Camino B. Además, si no hay chunks relevantes (bajo el umbral),
+# ni siquiera se llama al LLM.
+#
+# Rate limit (free tier): las llamadas se reintentan con backoff exponencial
+# ante error 429 (RESOURCE_EXHAUSTED). Si se agotan los reintentos, cae a B.
 # ─────────────────────────────────────────────────────────────────────────
-#
-# from langchain_ollama import ChatOllama
-# from langchain_core.prompts import ChatPromptTemplate
-#
-# _PROMPT_CULTURAL = ChatPromptTemplate.from_messages([
-#     ("system",
-#      "Eres Pishico, un asistente educativo cultural shipibo-konibo. "
-#      "Responde la pregunta del usuario usando ÚNICAMENTE la información "
-#      "del CONTEXTO proporcionado. Si el contexto no contiene la respuesta, "
-#      "responde 'No encontré información sobre eso en el documento de cosmovisión'. "
-#      "Mantén la respuesta breve (3 oraciones máximo) y en español neutro.\n\n"
-#      "CONTEXTO:\n{context}"),
-#     ("human", "{question}"),
-# ])
-#
-# _llm = None
-#
-# def _get_llm():
-#     global _llm
-#     if _llm is None:
-#         base_url = config.OLLAMA_URL.rstrip("/")
-#         if base_url.endswith("/api"):
-#             base_url = base_url[:-4]
-#         _llm = ChatOllama(
-#             model=config.OLLAMA_MODEL,
-#             base_url=base_url,
-#             temperature=config.OLLAMA_TEMPERATURE,
-#             timeout=config.OLLAMA_TIMEOUT,
-#         )
-#     return _llm
-#
-# def responder_llm(query: str) -> Dict[str, Any]:
-#     """Camino A: retrieval + síntesis con phi3.5 vía Ollama. Cae a B si falla."""
-#     chunks = buscar_chunks(query, k=config.RETRIEVE_K)
-#     relevantes = [c for c in chunks if c["score"] <= config.SCORE_THRESHOLD]
-#     if not relevantes:
-#         return {"respuesta": None, "chunks": chunks}
-#     contexto = "\n\n---\n\n".join(c["texto"] for c in relevantes)
-#     try:
-#         llm = _get_llm()
-#         chain = _PROMPT_CULTURAL | llm
-#         resp = chain.invoke({"context": contexto, "question": query})
-#         return {"respuesta": resp.content, "chunks": relevantes}
-#     except Exception as e:
-#         logger.warning("Camino A LLM falló (%s), cayendo a Camino B", e)
-#         return responder_simple(query)
+
+import time
+
+_SIN_DATOS = "SIN_DATOS_EN_CONTEXTO"
+
+_PROMPT_SISTEMA = (
+    "Eres Pishico, un asistente educativo cultural shipibo-konibo. "
+    "Responde la pregunta del usuario usando ÚNICAMENTE la información del "
+    "CONTEXTO proporcionado, que proviene de un documento de cosmovisión "
+    "shipibo. No agregues datos que no estén en el contexto ni inventes nada. "
+    f"Si el contexto no contiene la respuesta, responde exactamente: {_SIN_DATOS}. "
+    "Cuando sí haya respuesta, escríbela breve (3 oraciones máximo), en español "
+    "neutro y con respeto por la cultura shipibo-konibo."
+)
+
+# Cliente Gemini perezoso (se crea una sola vez).
+_gemini_client = None
+_gemini_import_ok = None  # None = no probado, True/False = resultado
+
+
+def _get_gemini_client():
+    """Crea (una vez) el cliente de Gemini. Devuelve None si no está disponible."""
+    global _gemini_client, _gemini_import_ok
+    if _gemini_import_ok is False:
+        return None
+    if _gemini_client is not None:
+        return _gemini_client
+    try:
+        from google import genai  # import perezoso: no rompe el Camino B si falta
+        _gemini_import_ok = True
+    except ImportError:
+        logger.warning(
+            "responder: google-genai no está instalado; Camino A no disponible. "
+            "Instalá con: pip install google-genai"
+        )
+        _gemini_import_ok = False
+        return None
+
+    if not config.GEMINI_API_KEY:
+        logger.warning(
+            "responder: GEMINI_API_KEY vacía; Camino A no disponible. "
+            "Configurala en el .env."
+        )
+        _gemini_import_ok = False
+        return None
+
+    try:
+        _gemini_client = genai.Client(api_key=config.GEMINI_API_KEY)
+        logger.info("responder: cliente Gemini inicializado (modelo=%s)",
+                    config.GEMINI_MODEL)
+        return _gemini_client
+    except Exception as e:
+        logger.warning("responder: no se pudo crear el cliente Gemini: %s", e)
+        _gemini_import_ok = False
+        return None
+
+
+def _es_error_rate_limit(exc: Exception) -> bool:
+    """True si la excepción parece un 429 / RESOURCE_EXHAUSTED de Gemini."""
+    txt = str(exc).lower()
+    return "429" in txt or "resource_exhausted" in txt or "rate limit" in txt or "quota" in txt
+
+
+def _llamar_gemini(contexto: str, query: str) -> Optional[str]:
+    """
+    Llama a Gemini con el contexto y la pregunta. Reintenta con backoff
+    exponencial ante 429. Devuelve el texto de la respuesta, o None si falla
+    definitivamente (para que el caller caiga al Camino B).
+    """
+    client = _get_gemini_client()
+    if client is None:
+        return None
+
+    from google.genai import types
+
+    prompt_usuario = f"CONTEXTO:\n{contexto}\n\nPREGUNTA: {query}"
+
+    for intento in range(config.GEMINI_MAX_REINTENTOS + 1):
+        try:
+            resp = client.models.generate_content(
+                model=config.GEMINI_MODEL,
+                contents=prompt_usuario,
+                config=types.GenerateContentConfig(
+                    system_instruction=_PROMPT_SISTEMA,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=config.GEMINI_THINKING_LEVEL
+                    ),
+                    http_options=types.HttpOptions(timeout=int(config.GEMINI_TIMEOUT * 1000)),
+                ),
+            )
+            texto = (resp.text or "").strip()
+            return texto or None
+        except Exception as e:
+            if _es_error_rate_limit(e) and intento < config.GEMINI_MAX_REINTENTOS:
+                espera = config.GEMINI_BACKOFF_BASE * (2 ** intento)
+                logger.warning(
+                    "responder: rate limit de Gemini (intento %d/%d); "
+                    "reintento en %.1fs",
+                    intento + 1, config.GEMINI_MAX_REINTENTOS, espera,
+                )
+                time.sleep(espera)
+                continue
+            # Otro error, o se agotaron los reintentos → caer a Camino B
+            logger.warning("responder: Gemini falló (%s); cae a Camino B", e)
+            return None
+    return None
 
 
 def responder_llm(query: str) -> Dict[str, Any]:
-    """Stub: Camino A no está activo. Ver docs/rag_camino_a.md para activarlo."""
-    raise NotImplementedError(
-        "Camino A (RAG con LLM) no está activado. "
-        "Ver docs/rag_camino_a.md para el procedimiento de activación."
-    )
+    """
+    Camino A: retrieval + síntesis con Gemini. Restringido al contexto para no
+    alucinar. Cae al Camino B (simple) si: no hay chunks relevantes, el LLM no
+    está disponible, se agota el rate limit, o el modelo responde SIN_DATOS.
+
+    El campo 'modo_usado' del dict devuelto refleja el origen REAL de la
+    respuesta ('llm' si la sintetizó Gemini, 'simple' si cayó al fallback).
+    """
+    chunks = buscar_chunks(query, k=config.RETRIEVE_K)
+    relevantes = [c for c in chunks if c["score"] <= config.SCORE_THRESHOLD]
+    if not relevantes:
+        # Sin contexto suficiente: no llamamos al LLM (evita alucinar e inventar)
+        return {"respuesta": None, "chunks": chunks, "modo_usado": "simple"}
+
+    contexto = "\n\n---\n\n".join(c["texto"] for c in relevantes)
+    texto = _llamar_gemini(contexto, query)
+
+    if texto is None:
+        # Falla del LLM o rate limit → fallback a Camino B
+        result = responder_simple(query)
+        result["modo_usado"] = "simple"
+        return result
+
+    if _SIN_DATOS in texto:
+        # Gemini juzgó que el contexto recuperado NO responde la pregunta.
+        # Mostrar igual ese pasaje crudo (Camino B) sería contraproducente: es
+        # justo el pasaje que el modelo descartó por irrelevante (así se veían
+        # mal "Ronin" y "onanya"). En su lugar devolvemos respuesta=None para
+        # que el bot dé su mensaje honesto ("no encontré información
+        # específica"), en vez de un chunk que no viene al caso.
+        logger.debug("responder: Gemini reportó SIN_DATOS para query=%r", query)
+        return {"respuesta": None, "chunks": relevantes, "modo_usado": "llm"}
+
+    # Enmarcar como respuesta cultural, coherente con el estilo del Camino B
+    respuesta = f"📚 {texto}"
+    return {"respuesta": respuesta, "chunks": relevantes, "modo_usado": "llm"}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -301,10 +399,12 @@ def responder(query: str, modo: str = None) -> Dict[str, Any]:
     if modo_efectivo == "llm":
         try:
             result = responder_llm(query)
-            result["modo_usado"] = "llm"
+            # responder_llm ya setea modo_usado real ('llm' o 'simple' si cayó).
+            result.setdefault("modo_usado", "llm")
             return result
-        except NotImplementedError:
-            logger.warning("Camino A no activado, cayendo a 'simple'")
+        except Exception as e:
+            # Red de seguridad ante cualquier error no contemplado.
+            logger.warning("responder: Camino A falló (%s); cae a 'simple'", e)
             result = responder_simple(query)
             result["modo_usado"] = "simple"
             return result

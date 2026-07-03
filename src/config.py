@@ -57,8 +57,25 @@ INDEX_DIR = DATA_DIR / "chroma_index"
 # Nombre de la colección dentro de ChromaDB
 COLLECTION = "cosmovision_shipibo"
 
-# ── Configuración del LLM (Camino A) ─────────────────────────────────────────
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3.5:latest")
-OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "60"))
-OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0.3"))
+# ── Configuración del LLM (Camino A) — Google Gemini (nube) ──────────────────
+# El Camino A usa la API de Gemini (Google AI Studio). La API key se toma de la
+# variable de entorno GEMINI_API_KEY (el SDK google-genai la lee automáticamente).
+# NUNCA hardcodear la key acá: va en el .env, que está en .gitignore.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# Modelo de Gemini. Para uso cost-sensitive (free tier), gemini-3.1-flash-lite
+# es el recomendado: cubierto por el tier gratuito y de baja latencia.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+
+# Timeout de la llamada HTTP a Gemini (segundos). Corto para que el bot no se
+# cuelgue esperando; si se excede, el Camino A cae al Camino B (simple).
+GEMINI_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT", "20"))
+
+# Nivel de "thinking" del modelo (minimal | low | medium | high).
+# Para respuestas culturales breves, low equilibra calidad y velocidad.
+GEMINI_THINKING_LEVEL = os.getenv("GEMINI_THINKING_LEVEL", "low")
+
+# ── Manejo de rate limit (free tier de Gemini) ───────────────────────────────
+# Reintentos con backoff exponencial ante error 429 (RESOURCE_EXHAUSTED).
+GEMINI_MAX_REINTENTOS = int(os.getenv("GEMINI_MAX_REINTENTOS", "3"))
+GEMINI_BACKOFF_BASE = float(os.getenv("GEMINI_BACKOFF_BASE", "1.5"))  # segundos
