@@ -21,7 +21,7 @@ from typing import List, Optional, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from . import config, retriever, responder
+from . import config, retriever, responder, orquestador
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -71,6 +71,37 @@ class StatsResponse(BaseModel):
     embed_model: Optional[str] = None
     index_dir: Optional[str] = None
     error: Optional[str] = None
+
+
+
+
+class TurnoHistorial(BaseModel):
+    rol: Literal["user", "model"]
+    texto: str
+
+
+class ConversarRequest(BaseModel):
+    mensaje: str = Field(..., min_length=1, max_length=500,
+                         description="Mensaje del usuario en el modo conversar")
+    historial: List[TurnoHistorial] = Field(
+        default_factory=list,
+        description="Turnos previos de la conversación (memoria multi-turno)"
+    )
+
+
+class ConversarResponse(BaseModel):
+    respuesta: Optional[str] = Field(
+        None, description="Respuesta del orquestador, o None si debe usarse el respaldo de reglas"
+    )
+    disponible: bool = Field(
+        ..., description="True si Gemini orquestó; False si el chatbot debe usar su pipeline de reglas"
+    )
+    herramientas_usadas: List[str] = Field(
+        default_factory=list, description="Herramientas que Gemini invocó (para debug)"
+    )
+    modulo_sugerido: Optional[str] = Field(
+        None, description="Si Gemini sugirió ir a un módulo ('vocabulario' o 'cuentos'), el chatbot muestra el botón de redirección"
+    )
 
 
 # ── Lifespan: pre-carga del índice al arrancar ───────────────────────────────
@@ -126,6 +157,31 @@ async def buscar(req: BuscarRequest) -> BuscarResponse:
     except Exception as e:
         logger.exception("Error procesando /buscar: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/conversar", response_model=ConversarResponse,
+          summary="Modo conversar libre orquestado por Gemini")
+async def conversar(req: ConversarRequest) -> ConversarResponse:
+    """
+    Modo "Conversa conmigo": Gemini orquesta la conversación libre y decide,
+    con function calling, cuándo traducir (corpus), enseñar una frase, consultar
+    cultura (RAG) o informar sobre la app. Si Gemini no está disponible, devuelve
+    disponible=False para que el chatbot use su pipeline de reglas de respaldo.
+    """
+    try:
+        historial = [{"rol": t.rol, "texto": t.texto} for t in req.historial]
+        result = orquestador.conversar(req.mensaje, historial=historial)
+        return ConversarResponse(
+            respuesta=result.get("respuesta"),
+            disponible=result.get("disponible", False),
+            herramientas_usadas=result.get("herramientas_usadas", []),
+            modulo_sugerido=result.get("modulo_sugerido"),
+        )
+    except Exception as e:
+        logger.exception("Error procesando /conversar: %s", e)
+        # No romper la conversación: señalar respaldo a reglas
+        return ConversarResponse(respuesta=None, disponible=False, herramientas_usadas=[])
+
 
 
 @app.get("/health", response_model=HealthResponse,
